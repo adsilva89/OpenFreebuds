@@ -7,10 +7,24 @@ from openfreebuds.utils.logger import create_logger
 from openfreebuds_qt.config import OfbQtConfigParser
 from openfreebuds_qt.utils import OfbCoreEvent
 
-try:
-    from openfreebuds_backend.linux.dbus.mpris import MPRISPProxy
-except ImportError:
+import platform
+
+# Detectar plataforma e usar método apropriado
+if platform.system() == "Windows":
+    # Windows: usar teclas de mídia
     MPRISPProxy = None
+    try:
+        from openfreebuds_backend.windows.media_keys import pause_media
+        MEDIA_KEYS_AVAILABLE = True
+    except ImportError:
+        MEDIA_KEYS_AVAILABLE = False
+else:
+    # Linux: usar MPRIS
+    MEDIA_KEYS_AVAILABLE = False
+    try:
+        from openfreebuds_backend.linux.dbus.mpris import MPRISPProxy
+    except ImportError:
+        MPRISPProxy = None
 
 log = create_logger("OfbQtMPRISHelperService")
 
@@ -25,6 +39,7 @@ class OfbQtMPRISHelperService:
         self._task: Optional[asyncio.Task] = None
         self.paused_players: list[MPRISPProxy] = []
         self.last_in_ear: bool = True
+        self.first_connection: bool = True  # Flag para detectar primeira conexão
 
     async def _trigger(self):
         in_ear = await self.ofb.get_property("state", "in_ear", "false") == "true"
@@ -32,18 +47,45 @@ class OfbQtMPRISHelperService:
 
         if in_ear != self.last_in_ear and enabled:
             if self.last_in_ear is True and in_ear is False:
-                # Pause all
-                self.paused_players = []
-                for service in await MPRISPProxy.get_all():
-                    if await service.playback_status() == "Playing":
-                        log.info(f"Pause {await service.identity()}")
-                        await service.pause()
-                        self.paused_players.append(service)
+                # Fone removido - pausar mídia (apenas se não for primeira conexão)
+                if not self.first_connection:
+                    log.info("Fone removido - pausando mídia")
+                    if MEDIA_KEYS_AVAILABLE:
+                        # Windows: usar teclas de mídia
+                        pause_media()
+                        self.paused_players = ["media_key_paused"]  # Marcar que pausamos via tecla
+                    elif MPRISPProxy is not None:
+                        # Linux: usar MPRIS
+                        self.paused_players = []
+                        for service in await MPRISPProxy.get_all():
+                            if await service.playback_status() == "Playing":
+                                log.info(f"Pause {await service.identity()}")
+                                await service.pause()
+                                self.paused_players.append(service)
+                else:
+                    log.info("Primeira conexão detectada - não pausando mídia")
+                    
             elif self.last_in_ear is False and in_ear is True:
-                for service in self.paused_players:
-                    log.info(f"Resume {await service.identity()}")
-                    await service.play()
-                self.paused_players = []
+                # Fone colocado - retomar mídia (apenas se tínhamos pausado antes)
+                if self.paused_players and not self.first_connection:
+                    log.info("Fone colocado - retomando mídia")
+                    if MEDIA_KEYS_AVAILABLE:
+                        # Windows: usar teclas de mídia para retomar
+                        pause_media()  # Play/Pause toggle
+                    elif MPRISPProxy is not None:
+                        # Linux: usar MPRIS
+                        for service in self.paused_players:
+                            log.info(f"Resume {await service.identity()}")
+                            await service.play()
+                    self.paused_players = []
+                else:
+                    log.info("Fone colocado (primeira vez ou sem mídia pausada)")
+                    
+            # Marcar que já não é mais a primeira conexão após qualquer mudança
+            if self.first_connection:
+                self.first_connection = False
+                log.info("Primeira conexão concluída - controle automático ativado")
+                
             self.last_in_ear = in_ear
 
     @staticmethod
@@ -64,6 +106,12 @@ class OfbQtMPRISHelperService:
         if not self.config.get("mpris", "enabled", False):
             return
 
+        # Verificar se temos algum método de controle disponível
+        if MPRISPProxy is None and not MEDIA_KEYS_AVAILABLE:
+            log.warning("Nenhum método de controle de mídia disponível")
+            return
+            
+        log.info("Iniciando controle automático de mídia")
         self._task = asyncio.create_task(self._main())
 
     async def _main(self):
