@@ -14,7 +14,7 @@ if platform.system() == "Windows":
     # Windows: usar teclas de mídia
     MPRISPProxy = None
     try:
-        from openfreebuds_backend.windows.media_keys import pause_media
+        from openfreebuds_backend.windows.media_keys import pause_media, is_music_playing
         MEDIA_KEYS_AVAILABLE = True
     except ImportError:
         MEDIA_KEYS_AVAILABLE = False
@@ -37,9 +37,11 @@ class OfbQtMPRISHelperService:
         self.config = OfbQtConfigParser.get_instance()
 
         self._task: Optional[asyncio.Task] = None
+        self._monitor_task: Optional[asyncio.Task] = None
         self.paused_players: list[MPRISPProxy] = []
         self.last_in_ear: bool = True
-        self.first_connection: bool = True  # Flag para detectar primeira conexão
+        self.music_playing_cache: bool = False  # Cache do status de música
+        self.last_music_check: float = 0  # Timestamp da última verificação
 
     async def _trigger(self):
         in_ear = await self.ofb.get_property("state", "in_ear", "false") == "true"
@@ -47,46 +49,69 @@ class OfbQtMPRISHelperService:
 
         if in_ear != self.last_in_ear and enabled:
             if self.last_in_ear is True and in_ear is False:
-                # Fone removido - pausar mídia (apenas se não for primeira conexão)
-                if not self.first_connection:
-                    log.info("Fone removido - pausando mídia")
-                    if MEDIA_KEYS_AVAILABLE:
-                        # Windows: usar teclas de mídia
+                # Fone removido - pausar mídia se estiver tocando
+                if MEDIA_KEYS_AVAILABLE:
+                    # Windows: usar cache do status de música
+                    if self.music_playing_cache:
+                        log.info("Fone removido - música tocando (cache), pausando")
                         pause_media()
-                        self.paused_players = ["media_key_paused"]  # Marcar que pausamos via tecla
-                    elif MPRISPProxy is not None:
-                        # Linux: usar MPRIS
-                        self.paused_players = []
-                        for service in await MPRISPProxy.get_all():
-                            if await service.playback_status() == "Playing":
-                                log.info(f"Pause {await service.identity()}")
-                                await service.pause()
-                                self.paused_players.append(service)
-                else:
-                    log.info("Primeira conexão detectada - não pausando mídia")
+                        self.paused_players = ["media_key_paused"]
+                    else:
+                        log.info("Fone removido - nenhuma música tocando (cache), nada a pausar")
+                elif MPRISPProxy is not None:
+                    # Linux: usar MPRIS
+                    self.paused_players = []
+                    for service in await MPRISPProxy.get_all():
+                        if await service.playback_status() == "Playing":
+                            log.info(f"Pause {await service.identity()}")
+                            await service.pause()
+                            self.paused_players.append(service)
                     
             elif self.last_in_ear is False and in_ear is True:
-                # Fone colocado - retomar mídia (apenas se tínhamos pausado antes)
-                if self.paused_players and not self.first_connection:
-                    log.info("Fone colocado - retomando mídia")
+                # Fone colocado - retomar mídia se tínhamos pausado antes
+                if self.paused_players:
                     if MEDIA_KEYS_AVAILABLE:
-                        # Windows: usar teclas de mídia para retomar
-                        pause_media()  # Play/Pause toggle
+                        # Windows: usar cache do status de música
+                        if not self.music_playing_cache:
+                            log.info("Fone colocado - música pausada (cache), retomando")
+                            pause_media()  # Play/Pause toggle
+                        else:
+                            log.info("Fone colocado - música já tocando (cache), não retomando")
                     elif MPRISPProxy is not None:
                         # Linux: usar MPRIS
                         for service in self.paused_players:
                             log.info(f"Resume {await service.identity()}")
                             await service.play()
                     self.paused_players = []
-                else:
-                    log.info("Fone colocado (primeira vez ou sem mídia pausada)")
-                    
-            # Marcar que já não é mais a primeira conexão após qualquer mudança
-            if self.first_connection:
-                self.first_connection = False
-                log.info("Primeira conexão concluída - controle automático ativado")
                 
             self.last_in_ear = in_ear
+
+    async def _monitor_music_status(self):
+        """Monitor contínuo do status de música em background"""
+        log.info("Iniciando monitor de status de música em background")
+        
+        while True:
+            try:
+                if MEDIA_KEYS_AVAILABLE:
+                    # Atualizar cache do status de música a cada 2 segundos
+                    import time
+                    current_time = time.time()
+                    
+                    # Só verificar se passou tempo suficiente desde a última verificação
+                    if current_time - self.last_music_check >= 2.0:
+                        old_status = self.music_playing_cache
+                        self.music_playing_cache = is_music_playing()
+                        self.last_music_check = current_time
+                        
+                        # Log apenas quando o status muda
+                        if old_status != self.music_playing_cache:
+                            log.debug(f"Status de música mudou: {old_status} -> {self.music_playing_cache}")
+                
+                await asyncio.sleep(2)  # Verificar a cada 2 segundos
+                
+            except Exception as e:
+                log.error(f"Erro no monitor de música: {e}")
+                await asyncio.sleep(5)  # Esperar mais tempo em caso de erro
 
     @staticmethod
     def get_instance(ofb: IOpenFreebuds):
@@ -100,6 +125,12 @@ class OfbQtMPRISHelperService:
                 self._task.cancel()
                 await self._task
             self._task = None
+            
+        if self._monitor_task is not None:
+            with suppress(Exception):
+                self._monitor_task.cancel()
+                await self._monitor_task
+            self._monitor_task = None
 
     async def start(self):
         await self.stop()
@@ -113,6 +144,10 @@ class OfbQtMPRISHelperService:
             
         log.info("Iniciando controle automático de mídia")
         self._task = asyncio.create_task(self._main())
+        
+        # Iniciar monitor de música em background se estivermos no Windows
+        if MEDIA_KEYS_AVAILABLE:
+            self._monitor_task = asyncio.create_task(self._monitor_music_status())
 
     async def _main(self):
         log.info("Started")
